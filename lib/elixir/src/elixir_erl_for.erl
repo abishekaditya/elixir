@@ -95,23 +95,24 @@ collect_filters([], Acc) ->
 build_inline(Ann, Clauses, Expr, Into, _Var, Acc, S) ->
   case lists:all(fun(Clause) -> element(1, Clause) == bin end, Clauses) of
     true  -> build_comprehension(Ann, Clauses, Expr, Into);
-    false -> build_inline(Clauses, Expr, Into, Acc, S)
+    false -> build_inline(Ann, Clauses, Expr, Into, Acc, S)
   end.
 
-build_inline(Clauses, Expr, false, Acc, S) ->
-  build_reduce(Clauses, Expr, {nil, 0}, Acc, S);
-build_inline(Clauses, Expr, {nil, Ann} = Into, Acc, S) ->
-  ListExpr = {cons, Ann, Expr, Acc},
+build_inline(Ann, Clauses, Expr, false, Acc, S) ->
+  InnerFun = fun(InnerExpr, _InnerAcc) -> InnerExpr end,
+  build_reduce(Ann, Clauses, InnerFun, Expr, {nil, Ann}, Acc, S);
+build_inline(Ann, Clauses, Expr, {nil, _} = Into, Acc, S) ->
+  InnerFun = fun(InnerExpr, InnerAcc) -> {cons, Ann, InnerExpr, InnerAcc} end,
   elixir_erl:remote(Ann, lists, reverse,
-    [build_reduce(Clauses, ListExpr, Into, Acc, S)]);
-build_inline(Clauses, Expr, {bin, Ann, _} = Into, Acc, S) ->
-  BinExpr = {cons, Ann, Acc, Expr},
+    [build_reduce(Ann, Clauses, InnerFun, Expr, Into, Acc, S)]);
+build_inline(Ann, Clauses, Expr, {bin, _, _} = Into, Acc, S) ->
+  InnerFun = fun(InnerExpr, InnerAcc) -> {cons, Ann, InnerAcc, InnerExpr} end,
   elixir_erl:remote(Ann, erlang, iolist_to_binary,
-    [build_reduce(Clauses, BinExpr, Into, Acc, S)]).
+    [build_reduce(Ann, Clauses, InnerFun, Expr, Into, Acc, S)]).
 
 build_into(Ann, Clauses, Expr, {map, _, []}, _Var, Acc, S) ->
   {elixir_erl:remote(Ann, maps, from_list,
-    [build_inline(Clauses, Expr, {nil, Ann}, Acc, S)]), S};
+    [build_inline(Ann, Clauses, Expr, {nil, Ann}, Acc, S)]), S};
 
 build_into(Ann, Clauses, Expr, Into, Fun, Acc, S) ->
   {Kind, SK}   = build_var(Ann, S),
@@ -119,7 +120,9 @@ build_into(Ann, Clauses, Expr, Into, Fun, Acc, S) ->
   {Stack, ST}  = build_var(Ann, SR),
   {Done, SD}   = build_var(Ann, ST),
 
-  IntoExpr  = {call, Ann, Fun, [Acc, pair(Ann, cont, Expr)]},
+  InnerFun =
+    fun(InnerExpr, InnerAcc) -> {call, Ann, Fun, [InnerAcc, pair(Ann, cont, InnerExpr)]} end,
+
   MatchExpr = {match, Ann,
     {tuple, Ann, [Acc, Fun]},
     elixir_erl:remote(Ann, 'Elixir.Collectable', into, [Into])
@@ -127,7 +130,7 @@ build_into(Ann, Clauses, Expr, Into, Fun, Acc, S) ->
 
   TryExpr =
     {'try', Ann,
-      [build_reduce(Clauses, IntoExpr, Acc, Acc, SD)],
+      [build_reduce(Ann, Clauses, InnerFun, Expr, Acc, Acc, SD)],
       [{clause, Ann,
         [Done],
         [],
@@ -144,12 +147,24 @@ build_into(Ann, Clauses, Expr, Into, Fun, Acc, S) ->
 
 %% Helpers
 
-build_reduce(Clauses, Expr, Into, Acc, S) ->
+build_reduce(Ann, Clauses, InnerFun, Expr, Into, Acc, S) ->
   %% The unique logic should go here:
   %% 1. We need to transform the initial accumulator
+  NewInto = {tuple, Ann, [Into, {map, Ann, []}]},
+
   %% 2. We need to receive how the cons operation is performed as a function
+  %% We unwrap the accumulator before calling it and then we add a new empty
+  %% map back. The proper code would have to use new vars.
+  InnerExpr =
+    {tuple, Ann, [
+      InnerFun(Expr, elixir_erl:remote(Ann, erlang, element, [{integer, Ann, 1}, Acc])),
+      {map, Ann, []}
+    ]},
+
+  EnumReduceCall = build_reduce_each(Clauses, InnerExpr, NewInto, Acc, S),
+
   %% 3. We need to extract uniq out of the tuple here.
-  build_reduce_each(Clauses, Expr, Into, Acc, S).
+  elixir_erl:remote(Ann, erlang, element, [{integer, Ann, 1}, EnumReduceCall]).
 
 build_reduce_each([{enum, Meta, Left, Right, Filters} | T], Expr, Arg, Acc, S) ->
   Ann = ?ann(Meta),
