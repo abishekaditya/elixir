@@ -95,18 +95,23 @@ collect_filters([], Acc) ->
 build_inline(Ann, Clauses, Expr, Into, _Var, Acc, S) ->
   case lists:all(fun(Clause) -> element(1, Clause) == bin end, Clauses) of
     true  -> build_comprehension(Ann, Clauses, Expr, Into);
-    false -> build_reduce(Clauses, Expr, Into, Acc, S)
+    false -> build_inline(Clauses, Expr, Into, Acc, S)
   end.
 
-build_into(Ann, Clauses, Expr, {map, _, []} = Into, _Var, Acc, S) ->
-  {Key, SK} = build_var(Ann, S),
-  {Val, SV} = build_var(Ann, SK),
-  MapExpr =
-    {block, Ann, [
-      {match, Ann, {tuple, Ann, [Key, Val]}, Expr},
-      {call, Ann, {remote, Ann, {atom, Ann, maps}, {atom, Ann, put}}, [Key, Val, Acc]}
-    ]},
-  {build_reduce_clause(Clauses, MapExpr, Into, Acc, SV), SV};
+build_inline(Clauses, Expr, false, Acc, S) ->
+  build_reduce(Clauses, Expr, {nil, 0}, Acc, S);
+build_inline(Clauses, Expr, {nil, Ann} = Into, Acc, S) ->
+  ListExpr = {cons, Ann, Expr, Acc},
+  elixir_erl:remote(Ann, lists, reverse,
+    [build_reduce(Clauses, ListExpr, Into, Acc, S)]);
+build_inline(Clauses, Expr, {bin, Ann, _} = Into, Acc, S) ->
+  BinExpr = {cons, Ann, Acc, Expr},
+  elixir_erl:remote(Ann, erlang, iolist_to_binary,
+    [build_reduce(Clauses, BinExpr, Into, Acc, S)]).
+
+build_into(Ann, Clauses, Expr, {map, _, []}, _Var, Acc, S) ->
+  {elixir_erl:remote(Ann, maps, from_list,
+    [build_inline(Clauses, Expr, {nil, Ann}, Acc, S)]), S};
 
 build_into(Ann, Clauses, Expr, Into, Fun, Acc, S) ->
   {Kind, SK}   = build_var(Ann, S),
@@ -122,7 +127,7 @@ build_into(Ann, Clauses, Expr, Into, Fun, Acc, S) ->
 
   TryExpr =
     {'try', Ann,
-      [build_reduce_clause(Clauses, IntoExpr, Acc, Acc, SD)],
+      [build_reduce(Clauses, IntoExpr, Acc, Acc, SD)],
       [{clause, Ann,
         [Done],
         [],
@@ -139,20 +144,16 @@ build_into(Ann, Clauses, Expr, Into, Fun, Acc, S) ->
 
 %% Helpers
 
-build_reduce(Clauses, Expr, false, Acc, S) ->
-  build_reduce_clause(Clauses, Expr, {nil, 0}, Acc, S);
-build_reduce(Clauses, Expr, {nil, Ann} = Into, Acc, S) ->
-  ListExpr = {cons, Ann, Expr, Acc},
-  elixir_erl:remote(Ann, lists, reverse,
-    [build_reduce_clause(Clauses, ListExpr, Into, Acc, S)]);
-build_reduce(Clauses, Expr, {bin, Ann, _} = Into, Acc, S) ->
-  BinExpr = {cons, Ann, Acc, Expr},
-  elixir_erl:remote(Ann, erlang, iolist_to_binary,
-    [build_reduce_clause(Clauses, BinExpr, Into, Acc, S)]).
+build_reduce(Clauses, Expr, Into, Acc, S) ->
+  %% The unique logic should go here:
+  %% 1. We need to transform the initial accumulator
+  %% 2. We need to receive how the cons operation is performed as a function
+  %% 3. We need to extract uniq out of the tuple here.
+  build_reduce_each(Clauses, Expr, Into, Acc, S).
 
-build_reduce_clause([{enum, Meta, Left, Right, Filters} | T], Expr, Arg, Acc, S) ->
+build_reduce_each([{enum, Meta, Left, Right, Filters} | T], Expr, Arg, Acc, S) ->
   Ann = ?ann(Meta),
-  True = build_reduce_clause(T, Expr, Acc, Acc, S),
+  True = build_reduce_each(T, Expr, Acc, Acc, S),
   False = Acc,
   Generated = erl_anno:set_generated(true, Ann),
 
@@ -173,13 +174,13 @@ build_reduce_clause([{enum, Meta, Left, Right, Filters} | T], Expr, Arg, Acc, S)
   Args  = [Right, Arg, {'fun', Ann, {clauses, Clauses1}}],
   elixir_erl:remote(Ann, 'Elixir.Enum', reduce, Args);
 
-build_reduce_clause([{bin, Meta, Left, Right, Filters} | T], Expr, Arg, Acc, S) ->
+build_reduce_each([{bin, Meta, Left, Right, Filters} | T], Expr, Arg, Acc, S) ->
   Ann = ?ann(Meta),
   Generated  = erl_anno:set_generated(true, Ann),
   {Tail, ST} = build_var(Ann, S),
   {Fun, SF}  = build_var(Ann, ST),
 
-  True  = build_reduce_clause(T, Expr, Acc, Acc, SF),
+  True  = build_reduce_each(T, Expr, Acc, Acc, SF),
   False = Acc,
 
   {bin, _, Elements} = Left,
@@ -207,7 +208,7 @@ build_reduce_clause([{bin, Meta, Left, Right, Filters} | T], Expr, Arg, Acc, S) 
     {named_fun, Ann, element(3, Fun), Clauses},
     [Right, Arg]};
 
-build_reduce_clause([], Expr, _Arg, _Acc, _S) ->
+build_reduce_each([], Expr, _Arg, _Acc, _S) ->
   Expr.
 
 is_var({var, _, _}) -> true;
